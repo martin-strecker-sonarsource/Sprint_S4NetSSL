@@ -14,7 +14,7 @@ namespace TestProject1
         [TestMethod]
         public async Task TestMethod1()
         {
-            var certFile = GenerateSelfSignedCertificate();
+            var certFile = GenerateWebServerCertificate(GenerateIntermediateCA(GenerateRootCA()));
             var settings = new WireMockServerSettings
             {
                 Urls = ["https://localhost:9095/"],
@@ -22,7 +22,7 @@ namespace TestProject1
                 UseSSL = true,
                 CertificateSettings = new WireMockCertificateSettings
                 {
-                    X509CertificateFilePath = certFile,
+                    X509CertificateFilePath = new FileInfo(certFile).FullName,
                 }
             };
             var server = WireMockServer.Start(settings);
@@ -39,7 +39,7 @@ namespace TestProject1
                     {
                         chain2.ChainPolicy.ExtraStore.Add(serverCert);
                     }
-                    var chain3 = chain2.Build(new X509Certificate2(cert));
+                    var valid = chain2.Build(new X509Certificate2(cert));
                 }
                 return true;
             };
@@ -80,9 +80,9 @@ namespace TestProject1
 
         public static string GenerateRootCA()
         {
-            var ecdsa = ECDsa.Create();
+            var rsa = RSA.Create();
 
-            var certRequest = new CertificateRequest($"CN=RootCA", ecdsa, HashAlgorithmName.SHA256);
+            var certRequest = new CertificateRequest($"CN=RootCA", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             certRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true)); // CA: true
             certRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(certRequest.PublicKey, false));
             certRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
@@ -96,12 +96,12 @@ namespace TestProject1
         public static string GenerateIntermediateCA(string rootCA)
         {
             var rootCert = X509CertificateLoader.LoadPkcs12FromFile(rootCA, null);
-            var ecdsa = ECDsa.Create();
+            var rsa = RSA.Create();
             // Create a certificate request for the intermediate certificate
             var request = new CertificateRequest(
                 "CN=IntermediateCA",
-                ecdsa,
-                HashAlgorithmName.SHA256);
+                rsa,
+                HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             // Set the certificate extensions
             request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true)); // CA: true
             request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
@@ -115,7 +115,7 @@ namespace TestProject1
                 DateTimeOffset.UtcNow.AddDays(-1),
                 DateTimeOffset.UtcNow.AddYears(101),
                 Guid.NewGuid().ToByteArray());
-            var intermediateCert2 = intermediateCert.CopyWithPrivateKey(ecdsa);
+            var intermediateCert2 = intermediateCert.CopyWithPrivateKey(rsa);
             var collection = new X509Certificate2Collection
             {
                 new X509Certificate2(rootCert.RawData),
@@ -130,8 +130,8 @@ namespace TestProject1
         {
             var allCerts = X509CertificateLoader.LoadPkcs12CollectionFromFile(certificateCA, null);
             var rootCert = allCerts.Last();
-            var ecdsa = ECDsa.Create();
-            var certRequest = new CertificateRequest($"CN=localhost", ecdsa, HashAlgorithmName.SHA256);
+            var rsa = RSA.Create();
+            var certRequest = new CertificateRequest($"CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
 
             //add extensions to the request (just as an example)
             //add keyUsage
@@ -140,13 +140,12 @@ namespace TestProject1
             certRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
             certRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection() { Oid.FromFriendlyName("Server Authentication", OidGroup.EnhancedKeyUsage) }, true));
 
-            var signatureGenerator = X509SignatureGenerator.CreateForECDsa(rootCert.GetECDsaPrivateKey());
             X509Certificate2 generatedCert = certRequest.Create(
                 rootCert,
                 DateTimeOffset.UtcNow.AddDays(-1),
                 DateTimeOffset.UtcNow.AddYears(100),
                 Guid.NewGuid().ToByteArray());
-            generatedCert = generatedCert.CopyWithPrivateKey(ecdsa);
+            generatedCert = generatedCert.CopyWithPrivateKey(rsa);
             var collection = new X509Certificate2Collection(allCerts.Select(c => new X509Certificate2(c.RawData)).ToArray())
             {
                 generatedCert
