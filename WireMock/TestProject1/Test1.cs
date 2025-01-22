@@ -1,4 +1,5 @@
-﻿using System.Net.Security;
+﻿using Microsoft.Net.Http.Headers;
+using System.Net.Security;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using WireMock.RequestBuilders;
@@ -29,46 +30,47 @@ namespace TestProject1
             };
             var server = WireMockServer.Start(settings);
             server.Given(Request.Create().WithPath("/").UsingGet()).RespondWith(Response.Create().WithStatusCode(200).WithBody("Hello World"));
+            // Setup certificate revocation list handling (create two crls and the server to serve them)
             var crlIntermediate = new CertificateRevocationListBuilder().Build(X509CertificateLoader.LoadPkcs12FromFile(intermdiateCA, null), 1, DateTimeOffset.Now.AddYears(99), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             var crlServer = WireMockServer.Start(9999);
             crlServer.Given(Request.Create().WithPath("/Intermediate.crl")).RespondWith(
                 Response.Create()
                 .WithStatusCode(200)
-                .WithHeader("Content-Type", "application/pkix-crl")
-                .WithHeader("Content-Disposition", "attachment; filename=crl.crl")
-                .WithHeader("Content-Transfer-Encoding", "binary")
-                .WithHeader("Content-Length", crlIntermediate.Length.ToString())
+                .WithHeader(HeaderNames.ContentType, "application/pkix-crl")
+                .WithHeader(HeaderNames.ContentDisposition, "attachment; filename=Intermediate.crl")
+                .WithHeader(HeaderNames.ContentLength, crlIntermediate.Length.ToString())
                 .WithBody(crlIntermediate));
             var crlRoot = new CertificateRevocationListBuilder().Build(X509CertificateLoader.LoadPkcs12FromFile(rootCA, null), 1, DateTimeOffset.Now.AddYears(99), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             crlServer.Given(Request.Create().WithPath("/Root.crl")).RespondWith(
                 Response.Create()
                 .WithStatusCode(200)
-                .WithHeader("Content-Type", "application/pkix-crl")
-                .WithHeader("Content-Disposition", "attachment; filename=crl.crl")
-                .WithHeader("Content-Transfer-Encoding", "binary")
-                .WithHeader("Content-Length", crlRoot.Length.ToString())
+                .WithHeader(HeaderNames.ContentType, "application/pkix-crl")
+                .WithHeader(HeaderNames.ContentDisposition, "attachment; filename=Root.crl")
+                .WithHeader(HeaderNames.ContentLength, crlRoot.Length.ToString())
                 .WithBody(crlRoot));
             var handler = new HttpClientHandler();
             handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) =>
             {
-                var log = crlServer.LogEntries;
                 if (errors == SslPolicyErrors.RemoteCertificateChainErrors)
                 {
                     var chain2 = new X509Chain(chain.SafeHandle.DangerousGetHandle());
-                    chain2.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                    chain2.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust; // We can not use this because .Net 5
                     var serverCertCollection = X509CertificateLoader.LoadPkcs12CollectionFromFile(certFile, null);
                     foreach (var serverCert in serverCertCollection)
                     {
                         chain2.ChainPolicy.ExtraStore.Add(serverCert);
-                        chain2.ChainPolicy.CustomTrustStore.Add(serverCert);
+                        chain2.ChainPolicy.CustomTrustStore.Add(serverCert); // This is also .Net5
                     }
                     var valid = chain2.Build(new X509Certificate2(cert));
+                    return true;
                 }
-                return true;
+                return errors == SslPolicyErrors.None;
             };
             using var client = new HttpClient(handler);
 
             var result = await client.GetStringAsync("https://localhost:9095/");
+            Assert.AreEqual("Hello World", result);
+            Assert.AreEqual(crlServer.LogEntries.Count, 2); // Two request to the crl server for the root and the intermediate CA
         }
 
         [TestMethod]
