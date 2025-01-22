@@ -14,7 +14,9 @@ namespace TestProject1
         [TestMethod]
         public async Task TestMethod1()
         {
-            var certFile = GenerateWebServerCertificate(GenerateIntermediateCA(GenerateRootCA()));
+            var rootCA = GenerateRootCA();
+            var intermdiateCA = GenerateIntermediateCA(rootCA);
+            var certFile = GenerateWebServerCertificate(intermdiateCA);
             var settings = new WireMockServerSettings
             {
                 Urls = ["https://localhost:9095/"],
@@ -27,9 +29,29 @@ namespace TestProject1
             };
             var server = WireMockServer.Start(settings);
             server.Given(Request.Create().WithPath("/").UsingGet()).RespondWith(Response.Create().WithStatusCode(200).WithBody("Hello World"));
+            var crlIntermediate = new CertificateRevocationListBuilder().Build(X509CertificateLoader.LoadPkcs12FromFile(intermdiateCA, null), 1, DateTimeOffset.Now.AddYears(99), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var crlServer = WireMockServer.Start(9999);
+            crlServer.Given(Request.Create().WithPath("/Intermediate.crl")).RespondWith(
+                Response.Create()
+                .WithStatusCode(200)
+                .WithHeader("Content-Type", "application/pkix-crl")
+                .WithHeader("Content-Disposition", "attachment; filename=crl.crl")
+                .WithHeader("Content-Transfer-Encoding", "binary")
+                .WithHeader("Content-Length", crlIntermediate.Length.ToString())
+                .WithBody(crlIntermediate));
+            var crlRoot = new CertificateRevocationListBuilder().Build(X509CertificateLoader.LoadPkcs12FromFile(rootCA, null), 1, DateTimeOffset.Now.AddYears(99), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            crlServer.Given(Request.Create().WithPath("/Root.crl")).RespondWith(
+                Response.Create()
+                .WithStatusCode(200)
+                .WithHeader("Content-Type", "application/pkix-crl")
+                .WithHeader("Content-Disposition", "attachment; filename=crl.crl")
+                .WithHeader("Content-Transfer-Encoding", "binary")
+                .WithHeader("Content-Length", crlRoot.Length.ToString())
+                .WithBody(crlRoot));
             var handler = new HttpClientHandler();
             handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) =>
             {
+                var log = crlServer.LogEntries;
                 if (errors == SslPolicyErrors.RemoteCertificateChainErrors)
                 {
                     var chain2 = new X509Chain(chain.SafeHandle.DangerousGetHandle());
@@ -38,6 +60,7 @@ namespace TestProject1
                     foreach (var serverCert in serverCertCollection)
                     {
                         chain2.ChainPolicy.ExtraStore.Add(serverCert);
+                        chain2.ChainPolicy.CustomTrustStore.Add(serverCert);
                     }
                     var valid = chain2.Build(new X509Certificate2(cert));
                 }
@@ -83,9 +106,10 @@ namespace TestProject1
             var rsa = RSA.Create();
 
             var certRequest = new CertificateRequest($"CN=RootCA", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-            certRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true)); // CA: true
+            certRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(certificateAuthority: true, false, 0, true));
             certRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(certRequest.PublicKey, false));
             certRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+            //certRequest.CertificateExtensions.Add(CertificateRevocationListBuilder.BuildCrlDistributionPointExtension((string[])["http://localhost:9999/crl.crl"]));
 
             X509Certificate2 rootCA = certRequest.CreateSelfSigned(DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddYears(102)); // generate the cert and sign!
             var file = "RootCA.pfx";
@@ -103,11 +127,11 @@ namespace TestProject1
                 rsa,
                 HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             // Set the certificate extensions
-            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true)); // CA: true
+            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(certificateAuthority: true, false, 0, true));
             request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
-            request.CertificateExtensions.Add(new X509AuthorityKeyIdentifierExtension(EncodeExtension(rootCert), false));
+            request.CertificateExtensions.Add(AuthorityKeyIdentifier(rootCert));
             request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
-
+            request.CertificateExtensions.Add(CertificateRevocationListBuilder.BuildCrlDistributionPointExtension((string[])["http://localhost:9999/Root.crl"]));
             // Sign the certificate with the root certificate
 
             var intermediateCert = request.Create(
@@ -116,11 +140,7 @@ namespace TestProject1
                 DateTimeOffset.UtcNow.AddYears(101),
                 Guid.NewGuid().ToByteArray());
             var intermediateCert2 = intermediateCert.CopyWithPrivateKey(rsa);
-            var collection = new X509Certificate2Collection
-            {
-                new X509Certificate2(rootCert.RawData),
-                intermediateCert2
-            };
+            X509Certificate2Collection collection = [X509CertificateLoader.LoadCertificate(rootCert.RawData), intermediateCert2];
             var file = "Intermediate.pfx";
             File.WriteAllBytes(file, collection.Export(X509ContentType.Pfx));
             return file;
@@ -136,9 +156,10 @@ namespace TestProject1
             //add extensions to the request (just as an example)
             //add keyUsage
 
-            certRequest.CertificateExtensions.Add(new X509AuthorityKeyIdentifierExtension(EncodeExtension(rootCert), false));
+            certRequest.CertificateExtensions.Add(AuthorityKeyIdentifier(rootCert));
             certRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
-            certRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection() { Oid.FromFriendlyName("Server Authentication", OidGroup.EnhancedKeyUsage) }, true));
+            certRequest.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension([Oid.FromFriendlyName("Server Authentication", OidGroup.EnhancedKeyUsage)], true));
+            certRequest.CertificateExtensions.Add(CertificateRevocationListBuilder.BuildCrlDistributionPointExtension((string[])["http://localhost:9999/Intermediate.crl"]));
 
             X509Certificate2 generatedCert = certRequest.Create(
                 rootCert,
@@ -146,32 +167,13 @@ namespace TestProject1
                 DateTimeOffset.UtcNow.AddYears(100),
                 Guid.NewGuid().ToByteArray());
             generatedCert = generatedCert.CopyWithPrivateKey(rsa);
-            var collection = new X509Certificate2Collection(allCerts.Select(c => new X509Certificate2(c.RawData)).ToArray())
-            {
-                generatedCert
-            };
+            X509Certificate2Collection collection = [.. allCerts.Select(c => X509CertificateLoader.LoadCertificate(c.RawData)), generatedCert];
             var file = "Webserver.pfx";
             File.WriteAllBytes(file, collection.Export(X509ContentType.Pfx));
             return file;
         }
 
-        private static byte[] EncodeExtension(X509Certificate2 certificateAuthority)
-        {
-            Oid SubjectKeyIdentifierOid = new Oid("2.5.29.14");
-
-            var subjectKeyIdentifier = certificateAuthority.Extensions.Cast<X509Extension>().FirstOrDefault(p => p.Oid?.Value == SubjectKeyIdentifierOid.Value);
-            if (subjectKeyIdentifier == null)
-                return null;
-            var rawData = subjectKeyIdentifier.RawData;
-            var segment = new ArraySegment<byte>(rawData, 2, rawData.Length - 2);
-            var authorityKeyIdentifier = new byte[segment.Count + 4];
-            // KeyID of the AuthorityKeyIdentifier
-            authorityKeyIdentifier[0] = 0x30;
-            authorityKeyIdentifier[1] = 0x16;
-            authorityKeyIdentifier[2] = 0x80;
-            authorityKeyIdentifier[3] = 0x14;
-            segment.CopyTo(authorityKeyIdentifier, 4);
-            return authorityKeyIdentifier;
-        }
+        private static X509AuthorityKeyIdentifierExtension AuthorityKeyIdentifier(X509Certificate2 certificateAuthority) =>
+            X509AuthorityKeyIdentifierExtension.CreateFromSubjectKeyIdentifier(certificateAuthority.Extensions.OfType<X509SubjectKeyIdentifierExtension>().First());
     }
 }
